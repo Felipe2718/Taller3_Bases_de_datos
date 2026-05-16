@@ -14,7 +14,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-MONGO_URI = os.environ("MONGO_URI")
+MONGO_URI = os.environ["MONGO_URI"]
 DATABASE_NAME = "ParranderosNoSQL" 
 
 client = MongoClient(MONGO_URI)
