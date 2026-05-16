@@ -15,7 +15,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-MONGO_URI = os.getenv("MONGO_URI", "mongodb://157.253.236.88:8087")
+MONGO_URI = os.environ("MONGO_URI")
 DATABASE_NAME = "ParranderosNoSQL" 
 
 try:
