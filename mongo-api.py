@@ -10,7 +10,6 @@ app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -18,11 +17,8 @@ app.add_middleware(
 MONGO_URI = os.environ("MONGO_URI")
 DATABASE_NAME = "ParranderosNoSQL" 
 
-try:
-    client = MongoClient(MONGO_URI)
-    db = client[DATABASE_NAME]
-except Exception as e:
-    print(f"Error crítico al conectar a MongoDB: {e}")
+client = MongoClient(MONGO_URI)
+db = client[DATABASE_NAME]
 
 
 @app.get("/bares/{bar_id}/comentarios")
