@@ -11,7 +11,7 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# CORS abierto para que Oracle APEX desde los servidores de la u pueda pegarle a Render sin bloqueos
+# CORS totalmente abierto para que los servidores de Oracle APEX le peguen a Render sin líos
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -20,18 +20,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Render toma la variable de entorno MONGO_URI que le configures en el Dashboard
+# Render va a leer esta variable de entorno desde su Dashboard
 MONGO_URI = os.environ.get("MONGO_URI")
 DATABASE_NAME = "DannAlpesMongo"
 
 if not MONGO_URI:
-    raise RuntimeError("CRÍTICO: La variable de entorno MONGO_URI no está configurada.")
+    raise RuntimeError("CRÍTICO: La variable de entorno MONGO_URI no está configurada en Render.")
 
 client = MongoClient(MONGO_URI)
 db = client[DATABASE_NAME]
 
-# Helper para limpiar los datos de Mongo antes de mandárselos a APEX
 def serializar_docs(docs):
+    """Transforma ObjectIds en strings y fechas en ISO strings para que APEX no muera parseando"""
     if isinstance(docs, list):
         for doc in docs:
             if "_id" in doc:
@@ -53,7 +53,7 @@ def serializar_docs(docs):
 
 @app.get("/hoteles/{hotel_id}/reseñas")
 def obtener_reseñas_por_hotel(hotel_id: int):
-    """Extrae las reseñas publicadas de un hotel para mostrarlas en APEX"""
+    """Extrae las reseñas publicadas de un hotel para pintarlas en un reporte de APEX"""
     try:
         cursor = db.reviews.find({"hotelId": hotel_id, "status": "publicada"}).sort("createdAt", -1)
         return serializar_docs(list(cursor))
@@ -62,7 +62,7 @@ def obtener_reseñas_por_hotel(hotel_id: int):
 
 @app.post("/reseñas")
 def crear_reseña(datos: Dict[str, Any] = Body(...)):
-    """Inserta una nueva reseña validando los tipos del $jsonSchema de tus compañeros"""
+    """Inserta una nueva reseña validando estrictamente los tipos del $jsonSchema de la entrega"""
     try:
         doc_reseña = {
             "reviewId": int(datos["reviewId"]),
@@ -85,11 +85,11 @@ def crear_reseña(datos: Dict[str, Any] = Body(...)):
         resultado = db.reviews.insert_one(doc_reseña)
         return {"status": "success", "inserted_id": str(resultado.inserted_id)}
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Fallo de validación NoSQL: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Fallo de validación NoSQL (revisa el esquema): {str(e)}")
 
 @app.put("/reseñas/{review_id}/respuesta")
 def agregar_respuesta_administrativa(review_id: int, datos: Dict[str, Any] = Body(...)):
-    """El admin responde una reseña (subdocumento embebido)"""
+    """Guarda la respuesta de la administración como un subdocumento embebido en la reseña"""
     try:
         respuesta = {
             "adminId": int(datos["adminId"]),
@@ -102,13 +102,13 @@ def agregar_respuesta_administrativa(review_id: int, datos: Dict[str, Any] = Bod
         )
         if resultado.matched_count == 0:
             raise HTTPException(status_code=404, detail="Reseña no encontrada")
-        return {"status": "success"}
+        return {"status": "success", "message": "Respuesta administrativa guardada"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.put("/reseñas/{review_id}/votar")
 def agregar_voto_utilidad(review_id: int, datos: Dict[str, Any] = Body(...)):
-    """Suma un voto de utilidad sin permitir duplicados por usuario"""
+    """Incrementa el contador e inserta el voto en el array si el usuario no ha votado antes"""
     try:
         user_id = int(datos["userId"])
         resultado = db.reviews.update_one(
@@ -119,25 +119,34 @@ def agregar_voto_utilidad(review_id: int, datos: Dict[str, Any] = Body(...)):
                 "$set": {"updatedAt": datetime.utcnow()}
             }
         )
-        return {"status": "success" if resultado.modified_count > 0 else "ya_voto"}
+        if resultado.modified_count == 0:
+            return {"status": "ignored", "message": "Este usuario ya votó o la reseña no existe"}
+        return {"status": "success"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.patch("/reseñas/{review_id}/destacar")
 def alternar_destacado(review_id: int, featured: bool = Body(embed=True)):
-    """Marca como destacada (featured: true/false)"""
+    """Modifica el flag booleano de reseñas destacadas de forma directa"""
     try:
-        db.reviews.update_one({"reviewId": review_id}, {"$set": {"featured": featured, "updatedAt": datetime.utcnow()}})
-        return {"status": "success"}
+        resultado = db.reviews.update_one(
+            {"reviewId": review_id}, 
+            {"$set": {"featured": featured, "updatedAt": datetime.utcnow()}}
+        )
+        if resultado.matched_count == 0:
+            raise HTTPException(status_code=404, detail="Reseña no encontrada")
+        return {"status": "success", "featured": featured}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
 # ==========================================
-# PIPELINES DE AGREGACIÓN (Tus RFCs del script 04)
+# REPORTES DE AGREGACIÓN (RFC1, RFC2, RFC3)
 # ==========================================
 
 @app.get("/reportes/rfc1")
 def obtener_rfc1():
+    """RFC1: Top 10 hoteles por calificación promedio durante el 2025"""
     try:
         pipeline = [
             { "$match": { "status": "publicada", "createdAt": { "$gte": datetime(2025, 1, 1), "$lte": datetime(2025, 12, 31, 23, 59, 59) } } },
@@ -153,13 +162,14 @@ def obtener_rfc1():
 
 @app.get("/reportes/rfc2/{hotel_id}")
 def obtener_rfc2(hotel_id: int):
+    """RFC2: Evolución mensual del promedio de un hotel específico durante el 2025"""
     try:
         pipeline = [
             { "$match": { "hotelId": hotel_id, "status": "publicada", "createdAt": { "$gte": datetime(2025, 1, 1), "$lte": datetime(2025, 12, 31, 23, 59, 59) } } },
             { "$group": { "_id": { "anio": { "$year": "$createdAt" }, "mes": { "$month": "$createdAt" } }, "avgRating": { "$avg": "$rating" }, "totalReviews": { "$sum": 1 } } },
             { "$addFields": { "avgRating": { "$round": ["$avgRating", 2] } } },
             { "$sort": { "_id.anio": 1, "_id.mes": 1 } },
-            { "$project": { _id: 0, "anio": "$_id.anio", "mes": "$_id.mes", "avgRating": 1, "totalReviews": 1 } }
+            { "$project": { "_id": 0, "anio": "$_id.anio", "mes": "$_id.mes", "avgRating": 1, "totalReviews": 1 } }
         ]
         return serializar_docs(list(db.reviews.aggregate(pipeline)))
     except Exception as e:
@@ -167,6 +177,7 @@ def obtener_rfc2(hotel_id: int):
 
 @app.get("/reportes/rfc3")
 def obtener_rfc3():
+    """RFC3: Análisis comparativo complejo de hoteles en Cartagena usando analítica por ventanas"""
     try:
         pipeline = [
             { "$match": { "cityName": "Cartagena", "status": "publicada" } },
