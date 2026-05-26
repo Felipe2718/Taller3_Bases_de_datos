@@ -1,77 +1,180 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
 from pymongo import MongoClient
 from datetime import datetime
-from typing import Dict, Any
+from typing import Dict, Any, List
 import os
 
-app = FastAPI()
+app = FastAPI(
+    title="Dann-Alpes NoSQL API Middleware",
+    description="API en Render para conectar Oracle APEX con MongoDB Atlas de forma autónoma",
+    version="1.0.0"
+)
 
+# CORS abierto para que Oracle APEX desde los servidores de la u pueda pegarle a Render sin bloqueos
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-MONGO_URI = os.environ["MONGO_URI"]
-DATABASE_NAME = "ParranderosNoSQL" 
+# Render toma la variable de entorno MONGO_URI que le configures en el Dashboard
+MONGO_URI = os.environ.get("MONGO_URI")
+DATABASE_NAME = "DannAlpesMongo"
+
+if not MONGO_URI:
+    raise RuntimeError("CRÍTICO: La variable de entorno MONGO_URI no está configurada.")
 
 client = MongoClient(MONGO_URI)
 db = client[DATABASE_NAME]
 
+# Helper para limpiar los datos de Mongo antes de mandárselos a APEX
+def serializar_docs(docs):
+    if isinstance(docs, list):
+        for doc in docs:
+            if "_id" in doc:
+                doc["_id"] = str(doc["_id"])
+            for key, val in doc.items():
+                if isinstance(val, datetime):
+                    doc[key] = val.isoformat()
+    elif isinstance(docs, dict):
+        if "_id" in docs:
+            docs["_id"] = str(docs["_id"])
+        for key, val in docs.items():
+            if isinstance(val, datetime):
+                docs[key] = val.isoformat()
+    return docs
 
-@app.get("/bares/{bar_id}/comentarios")
-def get_comentarios(bar_id: int):
+# ==========================================
+# OPERACIONES DE LA INTERFAZ (Tus RFs)
+# ==========================================
+
+@app.get("/hoteles/{hotel_id}/reseñas")
+def obtener_reseñas_por_hotel(hotel_id: int):
+    """Extrae las reseñas publicadas de un hotel para mostrarlas en APEX"""
     try:
-        cursor = db.comentarios_bares.find({"bar_id": bar_id})
-        comentarios = list(cursor)
-
-        for comentario in comentarios:
-            comentario["_id"] = str(comentario["_id"])
-            
-        return comentarios
+        cursor = db.reviews.find({"hotelId": hotel_id, "status": "publicada"}).sort("createdAt", -1)
+        return serializar_docs(list(cursor))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
-@app.post("/bares/{bar_id}/comentarios")
-def post_comentario(bar_id: int, datos: Dict[str, Any]):
-    
+@app.post("/reseñas")
+def crear_reseña(datos: Dict[str, Any] = Body(...)):
+    """Inserta una nueva reseña validando los tipos del $jsonSchema de tus compañeros"""
     try:
-        datos["bar_id"] = bar_id
-        if "date" not in datos or not datos["date"]:
-            datos["date"] = datetime.utcnow().strftime("%Y-%m-%d") 
-        resultado = db.comentarios_bares.insert_one(datos)
-        
+        doc_reseña = {
+            "reviewId": int(datos["reviewId"]),
+            "hotelId": int(datos["hotelId"]),
+            "hotelName": str(datos.get("hotelName", "Hotel Dann-Alpes")),
+            "cityId": int(datos.get("cityId", 0)),
+            "cityName": str(datos.get("cityName", "")),
+            "clientId": int(datos["clientId"]),
+            "reservationId": int(datos["reservationId"]),
+            "rating": int(datos["rating"]),
+            "text": str(datos["text"]),
+            "status": str(datos.get("status", "publicada")),
+            "createdAt": datetime.utcnow(),
+            "updatedAt": datetime.utcnow(),
+            "helpfulCount": 0,
+            "helpfulVotes": [],
+            "adminResponse": None,
+            "featured": False
+        }
+        resultado = db.reviews.insert_one(doc_reseña)
         return {"status": "success", "inserted_id": str(resultado.inserted_id)}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=400, detail=f"Fallo de validación NoSQL: {str(e)}")
 
-@app.get("/bares/{bar_id}/eventos")
-def get_eventos(bar_id: int):
-    
+@app.put("/reseñas/{review_id}/respuesta")
+def agregar_respuesta_administrativa(review_id: int, datos: Dict[str, Any] = Body(...)):
+    """El admin responde una reseña (subdocumento embebido)"""
     try:
-        cursor = db.eventos.find({"bar_id": bar_id})
-        eventos = list(cursor)
-        
-        for evento in eventos:
-            evento["_id"] = str(evento["_id"])
-            
-        return eventos
+        respuesta = {
+            "adminId": int(datos["adminId"]),
+            "text": str(datos["text"]),
+            "respondedAt": datetime.utcnow()
+        }
+        resultado = db.reviews.update_one(
+            {"reviewId": review_id},
+            {"$set": {"adminResponse": respuesta, "updatedAt": datetime.utcnow()}}
+        )
+        if resultado.matched_count == 0:
+            raise HTTPException(status_code=404, detail="Reseña no encontrada")
+        return {"status": "success"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
-@app.post("/bares/{bar_id}/eventos")
-def post_evento(bar_id: int, evento: Dict[str, Any]):
-    
+@app.put("/reseñas/{review_id}/votar")
+def agregar_voto_utilidad(review_id: int, datos: Dict[str, Any] = Body(...)):
+    """Suma un voto de utilidad sin permitir duplicados por usuario"""
     try:
-        evento["bar_id"] = bar_id
-        evento["fecha_creacion"] = datetime.utcnow().strftime("%Y-%m-%d")
-        
-        resultado = db.eventos.insert_one(evento)
-        
-        return {"status": "success", "inserted_id": str(resultado.inserted_id)}
+        user_id = int(datos["userId"])
+        resultado = db.reviews.update_one(
+            {"reviewId": review_id, "helpfulVotes.userId": {"$ne": user_id}},
+            {
+                "$push": {"helpfulVotes": {"userId": user_id, "votedAt": datetime.utcnow()}},
+                "$inc": {"helpfulCount": 1},
+                "$set": {"updatedAt": datetime.utcnow()}
+            }
+        )
+        return {"status": "success" if resultado.modified_count > 0 else "ya_voto"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.patch("/reseñas/{review_id}/destacar")
+def alternar_destacado(review_id: int, featured: bool = Body(embed=True)):
+    """Marca como destacada (featured: true/false)"""
+    try:
+        db.reviews.update_one({"reviewId": review_id}, {"$set": {"featured": featured, "updatedAt": datetime.utcnow()}})
+        return {"status": "success"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ==========================================
+# PIPELINES DE AGREGACIÓN (Tus RFCs del script 04)
+# ==========================================
+
+@app.get("/reportes/rfc1")
+def obtener_rfc1():
+    try:
+        pipeline = [
+            { "$match": { "status": "publicada", "createdAt": { "$gte": datetime(2025, 1, 1), "$lte": datetime(2025, 12, 31, 23, 59, 59) } } },
+            { "$group": { "_id": "$hotelId", "hotelName": { "$first": "$hotelName" }, "cityName": { "$first": "$cityName" }, "avgRating": { "$avg": "$rating" }, "totalReviews": { "$sum": 1 } } },
+            { "$addFields": { "avgRating": { "$round": ["$avgRating", 2] } } },
+            { "$sort": { "avgRating": -1, "totalReviews": -1 } },
+            { "$limit": 10 },
+            { "$project": { "_id": 0, "hotelId": "$_id", "hotelName": 1, "cityName": 1, "avgRating": 1, "totalReviews": 1 } }
+        ]
+        return serializar_docs(list(db.reviews.aggregate(pipeline)))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/reportes/rfc2/{hotel_id}")
+def obtener_rfc2(hotel_id: int):
+    try:
+        pipeline = [
+            { "$match": { "hotelId": hotel_id, "status": "publicada", "createdAt": { "$gte": datetime(2025, 1, 1), "$lte": datetime(2025, 12, 31, 23, 59, 59) } } },
+            { "$group": { "_id": { "anio": { "$year": "$createdAt" }, "mes": { "$month": "$createdAt" } }, "avgRating": { "$avg": "$rating" }, "totalReviews": { "$sum": 1 } } },
+            { "$addFields": { "avgRating": { "$round": ["$avgRating", 2] } } },
+            { "$sort": { "_id.anio": 1, "_id.mes": 1 } },
+            { "$project": { _id: 0, "anio": "$_id.anio", "mes": "$_id.mes", "avgRating": 1, "totalReviews": 1 } }
+        ]
+        return serializar_docs(list(db.reviews.aggregate(pipeline)))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/reportes/rfc3")
+def obtener_rfc3():
+    try:
+        pipeline = [
+            { "$match": { "cityName": "Cartagena", "status": "publicada" } },
+            { "$group": { "_id": "$hotelId", "hotelName": { "$first": "$hotelName" }, "cityName": { "$first": "$cityName" }, "avgRating": { "$avg": "$rating" }, "totalReviews": { "$sum": 1 }, "reviewsWithResponse": { "$sum": { "$cond": [{ "$and": [{ "$ifNull": ["$adminResponse", False] }, { "$ne": ["$adminResponse", None] }] }, 1, 0] } }, "reviewsFeatured": { "$sum": { "$cond": ["$featured", 1, 0] } } } },
+            { "$addFields": { "avgRating": { "$round": ["$avgRating", 2] }, "pctConRespuesta": { "$round": [{ "$multiply": [{ "$divide": ["$reviewsWithResponse", "$totalReviews"] }, 100] }, 1] }, "pctDestacadas": { "$round": [{ "$multiply": [{ "$divide": ["$reviewsFeatured", "$totalReviews"] }, 100] }, 1] } } },
+            { "$setWindowFields": { "partitionBy": "$cityName", "sortBy": { "avgRating": -1 }, "output": { "rankingCiudad": { "$rank": {} } } } },
+            { "$project": { "_id": 0, "hotelId": "$_id", "hotelName": 1, "cityName": 1, "avgRating": 1, "totalReviews": 1, "pctConRespuesta": 1, "pctDestacadas": 1, "rankingCiudad": 1 } }
+        ]
+        return serializar_docs(list(db.reviews.aggregate(pipeline)))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
